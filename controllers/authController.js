@@ -1,92 +1,127 @@
-const bcrypt = require('bcryptjs');
+const { signupUser, loginUser, getUserById } = require('../services/authService');
 const jwt = require('jsonwebtoken');
-const UserModel = require('../models/UserModel');
 
-// 🚀 Signup Controller
-exports.signup = (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ message: 'Email and password required' });
+// Signup Controller
+exports.signup = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: 'Email and password required' });
 
-  // 🕵️ Check if user already exists
-  UserModel.findByEmail(email, (err, result) => {
-    if (err) return res.status(500).json({ message: 'Server Error' });
-    if (result?.length > 0)
-      return res.status(400).json({ message: 'Email already exists' });
+    await signupUser({ email, password });
 
-    const passwordHash = bcrypt.hashSync(password, 10);
-
-    // 👤 New users always default to "user" role
-    const role = 'user';
-
-    UserModel.create(email, passwordHash, role, (err, result) => {
-      if (err) return res.status(500).json({ message: 'Server Error' });
-      return res.status(201).json({ message: 'User created' });
-    });
-  });
+    return res.status(201).json({ message: 'User created' });
+  } catch (error) {
+    console.error('Signup Error:', error);
+    return res.status(400).json({ message: error.message });
+  }
 };
 
-// 🔐 Login Controller
-exports.login = (req, res) => {
-  const { email, password } = req.body;
+// Login Controller
+exports.login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { token: accessToken } = await loginUser({ email, password });
 
-  UserModel.findByEmail(email, (err, results) => {
-    if (err || results.length === 0)
-      return res.status(400).json({ message: 'Invalid email or password' });
-
-    const user = results[0];
-    const isMatch = bcrypt.compareSync(password, user.password_hash);
-    if (!isMatch)
-      return res.status(400).json({ message: 'Invalid email or password' });
-
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '1d' }
+    const refreshToken = jwt.sign(
+      { email },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: '7d' }
     );
 
-    // 🔐 Set token in cookie
-    res.cookie('token', token, {
+    res.cookie('accessToken', accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
       path: '/',
-      maxAge: 24 * 60 * 60 * 1000
+      maxAge: 15 * 60 * 1000, // 15 minutes
+    });
+
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     });
 
     res.json({ message: 'Login successful' });
+  } catch (error) {
+    console.error('Login Error:', error);
+    return res.status(400).json({ message: error.message });
+  }
+};
+
+
+// Refresh Token
+exports.refreshToken = (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  if (!refreshToken) {
+    return res.status(401).json({ message: 'No refresh token provided' });
+  }
+
+  jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid refresh token' });
+    }
+
+    const newAccessToken = jwt.sign(
+      { email: decoded.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    res.cookie('accessToken', newAccessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 15 * 60 * 1000 // 15 minutes
+    });
+
+    res.json({ message: 'Access token refreshed' });
   });
 };
 
 
-// Me controller (protected)
-exports.me = (req, res) => {
-  // req.user was set by verifyJWT
-  UserModel.findById(req.user.id, (err, results) => {
-    if (err || results.length === 0)
-      return res.status(404).json({ message: 'User not found' });
-    // never send password hash
-    const { password_hash, ...user } = results[0];
+// Me Controller (protected)
+exports.me = async (req, res) => {
+  try {
+    const user = await getUserById(req.user.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (user.password || user.password_hash) {
+      const { password, password_hash, ...safeUser } = user;
+      return res.json(safeUser);
+    }
+
     res.json(user);
-  });
+  } catch (error) {
+    console.error('Me Error:', error);
+    return res.status(500).json({ message: error.message });
+  }
 };
 
-// Logout controller
+// Logout Controller
 exports.logout = (req, res) => {
-  res.clearCookie('token', {
+  res.clearCookie('accessToken', {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'lax',
-    path: '/',           // ← same path as when it was set
+    path: '/',
   });
-  // double‑check by explicitly setting a blank cookie too:
-  res.setHeader(
-    'Set-Cookie',
-    'token=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax'
-  );
+
+  res.clearCookie('refreshToken', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+
+  res.setHeader('Set-Cookie', [
+    'accessToken=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax',
+    'refreshToken=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax',
+  ]);
+
   res.json({ message: 'Logged out successfully' });
 };
